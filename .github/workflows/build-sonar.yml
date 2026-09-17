@@ -1,0 +1,131 @@
+name: SonarQube Cloud Build-Based Scan
+
+on:
+  workflow_dispatch:
+
+jobs:
+  sonar:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Make Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Check Java and Gradle versions
+        run: |
+          echo "=== Java ==="
+          java -version
+
+          echo "=== Gradle ==="
+          ./gradlew --version
+
+      - name: Build AndroGoat
+        run: |
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Inspect compiled classes
+        run: |
+          echo "=== Build directories ==="
+          find app/build -type d | sort | head -100
+
+          echo
+          echo "=== Kotlin/Java class directories ==="
+          find app/build -type d \( \
+            -path "*/classes/*" -o \
+            -path "*/kotlin-classes/*" \
+          \) | sort
+
+          echo
+          echo "=== Number of compiled classes ==="
+          find app/build -type f -name "*.class" | wc -l
+
+          echo
+          echo "=== Sample compiled classes ==="
+          find app/build -type f -name "*.class" | head -50
+
+      - name: Resolve Gradle dependencies for Sonar
+        run: |
+          cat > /tmp/sonar-classpath.gradle <<'EOF'
+          allprojects {
+              afterEvaluate { project ->
+                  if (project.name == "app") {
+                      tasks.register("printSonarClasspath") {
+                          doLast {
+                              def config = configurations.findByName("debugRuntimeClasspath")
+                              if (config != null) {
+                                  println config.asPath
+                              } else {
+                                  throw new GradleException(
+                                      "debugRuntimeClasspath configuration not found"
+                                  )
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+          ./gradlew \
+            -I /tmp/sonar-classpath.gradle \
+            :app:printSonarClasspath \
+            --quiet \
+            --no-daemon > /tmp/runtime-classpath.txt
+
+          echo "=== Android debug runtime classpath ==="
+          cat /tmp/runtime-classpath.txt
+
+          tr ':' '\n' < /tmp/runtime-classpath.txt \
+            | grep -E '\.(jar|aar)$' \
+            | sort -u > /tmp/sonar-libraries.txt
+
+          echo
+          echo "=== Dependency libraries ==="
+          cat /tmp/sonar-libraries.txt
+
+          SONAR_LIBRARIES=$(paste -sd, /tmp/sonar-libraries.txt)
+          echo "SONAR_LIBRARIES=$SONAR_LIBRARIES" >> "$GITHUB_ENV"
+
+      - name: Determine compiled class directories
+        run: |
+          find app/build -type d \( \
+            -path "*/classes/*/debug" -o \
+            -path "*/kotlin-classes/debug" \
+          \) \
+            | sort -u > /tmp/sonar-binaries.txt
+
+          echo "=== Sonar binaries ==="
+          cat /tmp/sonar-binaries.txt
+
+          SONAR_BINARIES=$(paste -sd, /tmp/sonar-binaries.txt)
+          echo "SONAR_BINARIES=$SONAR_BINARIES" >> "$GITHUB_ENV"
+
+          if [ -z "$SONAR_BINARIES" ]; then
+            echo "ERROR: No compiled class directories found."
+            exit 1
+          fi
+
+      - name: SonarQube Scan
+        uses: SonarSource/sonarqube-scan-action@v8.2.1
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=appsec-bench_AndroGoat-build
+            -Dsonar.organization=appsec-bench
+            -Dsonar.sources=app/src/main
+            -Dsonar.java.binaries=${{ env.SONAR_BINARIES }}
+            -Dsonar.java.libraries=${{ env.SONAR_LIBRARIES }}
+            -Dsonar.verbose=true
